@@ -4,6 +4,14 @@ A macOS menu bar app that dramatically plays news music before every meeting.
 
 Inspired by [@rtwlz](https://x.com/rtwlz/status/2036082537949434164).
 
+<table>
+  <tr>
+    <td align="center"><img src="screenshots/countdown.png" width="280"/><br/><sub>Countdown in menu bar</sub></td>
+    <td align="center"><img src="screenshots/countdown-red.png" width="280"/><br/><sub>Last seconds — blinks red</sub></td>
+    <td align="center"><img src="screenshots/add-meeting.png" width="220"/><br/><sub>Add meeting dialog</sub></td>
+  </tr>
+</table>
+
 ## Features
 
 - **Countdown in the menu bar** — appears only when a meeting is < 15 minutes away
