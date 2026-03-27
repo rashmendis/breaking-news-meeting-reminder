@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import UniformTypeIdentifiers
 
 // MARK: - Model
 
@@ -44,6 +45,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var ticker: Timer?
     private var audioPlayer: AVAudioPlayer?
+    private var audioDuration: Int = 14   // seconds — auto-detected from file
     private var meetings: [Meeting] = []
     private var blinkOn = false
     private var audioTriggeredFor: Set<UUID> = []
@@ -59,6 +61,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Audio
 
     private func loadAudio() {
+        // 1. User-picked file (saved in App Support)
+        if let saved = UserDefaults.standard.string(forKey: "NewsTimer.audioPath") {
+            let url = URL(fileURLWithPath: saved)
+            if FileManager.default.fileExists(atPath: saved) {
+                initPlayer(url: url); return
+            }
+        }
+        // 2. Bundled default
         if let url = Bundle.main.url(forResource: "countdown", withExtension: "mp3") {
             initPlayer(url: url); return
         }
@@ -72,6 +82,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             audioPlayer = try AVAudioPlayer(contentsOf: url)
             audioPlayer?.prepareToPlay()
+            audioDuration = max(1, Int(ceil(audioPlayer!.duration)))
+            NSLog("Audio loaded: \(url.lastPathComponent), duration: \(audioDuration)s")
         } catch { NSLog("AVAudioPlayer: \(error)") }
     }
 
@@ -81,10 +93,50 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func playAudioIfNeeded(for meeting: Meeting, secondsUntil: Int) {
-        guard secondsUntil <= 14 else { return }
+        guard secondsUntil <= audioDuration else { return }
         guard !audioTriggeredFor.contains(meeting.id) else { return }
         audioTriggeredFor.insert(meeting.id)
         playAudio()
+    }
+
+    @objc private func chooseAudioAction() {
+        statusItem.menu?.cancelTracking()
+
+        let panel = NSOpenPanel()
+        panel.message = "Choose your countdown audio file"
+        panel.prompt = "Use this file"
+        panel.allowedContentTypes = [UTType.audio, UTType.mp3]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+
+        guard panel.runModal() == .OK, let src = panel.url else { return }
+
+        // Copy to Application Support so it survives moves/deletes
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let dir = appSupport.appendingPathComponent("NewsTimer")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dest = dir.appendingPathComponent("audio.\(src.pathExtension)")
+        try? FileManager.default.removeItem(at: dest)
+        do {
+            try FileManager.default.copyItem(at: src, to: dest)
+        } catch {
+            let err = NSAlert()
+            err.messageText = "Could not copy file"
+            err.informativeText = error.localizedDescription
+            err.runModal()
+            return
+        }
+
+        UserDefaults.standard.set(dest.path, forKey: "NewsTimer.audioPath")
+        audioTriggeredFor.removeAll()
+        initPlayer(url: dest)
+        buildMenu()
+
+        let info = NSAlert()
+        info.messageText = "Audio updated"
+        info.informativeText = "\(src.lastPathComponent)\nDuration: \(audioDuration)s — will play \(audioDuration)s before each meeting."
+        info.runModal()
     }
 
     // MARK: - Status Item
@@ -184,7 +236,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         playAudioIfNeeded(for: meeting, secondsUntil: secs)
 
-        if secs <= 14 {
+        if secs <= audioDuration {
             blinkOn.toggle()
             showText(button, text: label,
                      bg: blinkOn ? .systemRed : .clear,
@@ -229,6 +281,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let add = NSMenuItem(title: "Add Meeting…", action: #selector(addMeetingAction), keyEquivalent: "n")
         add.target = self
         menu.addItem(add)
+
+        menu.addItem(.separator())
+
+        let audioLabel: String = {
+            let name = UserDefaults.standard.string(forKey: "NewsTimer.audioPath")
+                .flatMap { URL(fileURLWithPath: $0).lastPathComponent } ?? "default"
+            return "Audio: \(name) (\(audioDuration)s)"
+        }()
+        let audioInfo = NSMenuItem(title: audioLabel, action: nil, keyEquivalent: "")
+        audioInfo.isEnabled = false
+        menu.addItem(audioInfo)
+
+        let choose = NSMenuItem(title: "Choose Audio File…", action: #selector(chooseAudioAction), keyEquivalent: "o")
+        choose.target = self
+        menu.addItem(choose)
 
         let test = NSMenuItem(title: "Test Audio ▶", action: #selector(testAudioAction), keyEquivalent: "t")
         test.target = self
