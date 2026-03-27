@@ -1,0 +1,13 @@
+# Built app and DMG
+*.app
+*.dmg
+tmp_*.dmg
+
+# Audio (copyright)
+*.mp3
+*.m4a
+*.wav
+*.aiff
+
+# macOS junk
+.DS_Store
