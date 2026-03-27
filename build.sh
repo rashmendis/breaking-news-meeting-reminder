@@ -3,7 +3,7 @@ set -e
 
 APP_NAME="NewsTimer"
 APP_BUNDLE="${APP_NAME}.app"
-AUDIO_SRC="$HOME/Downloads/bbc news start up theme.mp3"
+AUDIO_SRC="$(dirname "$0")/Resources/countdown.mp3"
 
 echo "==> Building ${APP_NAME}..."
 

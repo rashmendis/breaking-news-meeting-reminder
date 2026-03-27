@@ -3,11 +3,8 @@
 *.dmg
 tmp_*.dmg
 
-# Audio (copyright)
-*.mp3
-*.m4a
-*.wav
-*.aiff
+# Built audio copies (original stays in Resources/)
+NewsTimer.app/Contents/Resources/*.mp3
 
 # macOS junk
 .DS_Store
