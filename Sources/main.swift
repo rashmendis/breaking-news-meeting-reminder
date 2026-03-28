@@ -1,6 +1,7 @@
 import AppKit
 import AVFoundation
 import UniformTypeIdentifiers
+import EventKit
 
 // MARK: - Model
 
@@ -50,11 +51,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var blinkOn = false
     private var audioTriggeredFor: Set<UUID> = []
 
+    private let eventStore = EKEventStore()
+    private var calendarSyncEnabled: Bool = UserDefaults.standard.bool(forKey: "NewsTimer.calendarSyncEnabled")
+    private var calendarAutoRefreshEnabled: Bool = UserDefaults.standard.bool(forKey: "NewsTimer.calendarAutoRefreshEnabled")
+    private var lastCalendarSync: Date? = nil
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         loadMeetings()
         loadAudio()
         setupStatusItem()
+        if calendarSyncEnabled {
+            syncFromCalendarAction()
+        }
+        if calendarAutoRefreshEnabled {
+            scheduleCalendarAutoRefresh()
+        }
         startTicker()
     }
 
@@ -248,6 +260,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private var calendarRefreshTimer: Timer?
+
+    private func scheduleCalendarAutoRefresh(intervalMinutes: Int = 5) {
+        calendarRefreshTimer?.invalidate()
+        let interval = TimeInterval(intervalMinutes * 60)
+        calendarRefreshTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            self?.performAutoCalendarRefresh()
+        }
+        RunLoop.main.add(calendarRefreshTimer!, forMode: .common)
+        // Kick off an immediate refresh if we haven't yet this session
+        performAutoCalendarRefresh()
+    }
+
+    private func performAutoCalendarRefresh() {
+        guard calendarAutoRefreshEnabled else { return }
+        // Throttle: avoid syncing more often than every 60 seconds
+        if let last = lastCalendarSync, Date().timeIntervalSince(last) < 60 { return }
+        lastCalendarSync = Date()
+        syncFromCalendarAction()
+    }
+
     // MARK: - Menu
 
     private func buildMenu() {
@@ -304,6 +337,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let stop = NSMenuItem(title: "Stop Music ◼", action: #selector(stopAudioAction), keyEquivalent: "s")
         stop.target = self
         menu.addItem(stop)
+
+        menu.addItem(.separator())
+
+        let calHeader = NSMenuItem(title: "Calendar", action: nil, keyEquivalent: "")
+        calHeader.isEnabled = false
+        menu.addItem(calHeader)
+
+        let syncNow = NSMenuItem(title: "Sync from Calendar…", action: #selector(syncFromCalendarAction), keyEquivalent: "r")
+        syncNow.target = self
+        menu.addItem(syncNow)
+
+        let autoSync = NSMenuItem(title: "Auto-sync on launch", action: #selector(toggleCalendarAutoSync(_:)), keyEquivalent: "")
+        autoSync.target = self
+        autoSync.state = calendarSyncEnabled ? .on : .off
+        menu.addItem(autoSync)
+
+        let autoRefresh = NSMenuItem(title: "Auto-refresh every 5 min", action: #selector(toggleCalendarAutoRefresh(_:)), keyEquivalent: "")
+        autoRefresh.target = self
+        autoRefresh.state = calendarAutoRefreshEnabled ? .on : .off
+        menu.addItem(autoRefresh)
 
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -429,6 +482,132 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func saveMeetings() {
         if let data = try? JSONEncoder().encode(meetings) {
             UserDefaults.standard.set(data, forKey: "BBCMeetingTimer.meetings")
+        }
+    }
+
+    // MARK: - Calendar Sync
+
+    private func requestCalendarAccessIfNeeded(completion: @escaping (Bool) -> Void) {
+        switch EKEventStore.authorizationStatus(for: .event) {
+        case .authorized, .fullAccess:
+            completion(true)
+        case .writeOnly:
+            // Write-only access is insufficient for reading events
+            completion(false)
+        case .notDetermined:
+            if #available(macOS 14.0, *) {
+                eventStore.requestFullAccessToEvents { granted, _ in
+                    DispatchQueue.main.async { completion(granted) }
+                }
+            } else {
+                eventStore.requestAccess(to: .event) { granted, _ in
+                    DispatchQueue.main.async { completion(granted) }
+                }
+            }
+        case .denied, .restricted:
+            completion(false)
+        @unknown default:
+            completion(false)
+        }
+    }
+
+    private func fetchUpcomingCalendarMeetings(hoursAhead: Int = 12) -> [Meeting] {
+        let now = Date()
+        guard let end = Calendar.current.date(byAdding: .hour, value: hoursAhead, to: now) else { return [] }
+        let predicate = eventStore.predicateForEvents(withStart: now.addingTimeInterval(-60), end: end, calendars: nil)
+        let events = eventStore.events(matching: predicate)
+            .filter { !$0.isAllDay }
+            .sorted { $0.startDate < $1.startDate }
+
+        var result: [Meeting] = []
+        for ev in events {
+            let cal = Calendar.current
+            let comps = cal.dateComponents([.hour, .minute, .weekday], from: ev.startDate)
+            guard let hour = comps.hour, let minute = comps.minute, let wd = comps.weekday else { continue }
+
+            // Determine if the event is repeating weekly (simple heuristic using recurrenceRules)
+            let repeatsWeekly = ev.recurrenceRules?.contains(where: { rule in
+                rule.frequency == .weekly
+            }) ?? false
+
+            let meeting = Meeting(
+                id: ev.eventIdentifier.data(using: .utf8).map { UUID(uuid: uuidFromStringData($0)) } ?? UUID(),
+                name: ev.title,
+                hour: hour,
+                minute: minute,
+                weekdays: [wd],
+                repeatsWeekly: repeatsWeekly
+            )
+            result.append(meeting)
+        }
+        return result
+    }
+
+    private func uuidFromStringData(_ data: Data) -> uuid_t {
+        // Create a stable 16-byte value from eventIdentifier bytes using a simple rolling hash
+        var hash = [UInt8](repeating: 0, count: 16)
+        var a: UInt32 = 5381
+        var b: UInt32 = 52711
+        for byte in data {
+            a = ((a << 5) &+ a) &+ UInt32(byte) // a = a*33 + byte
+            b = ((b << 6) &+ (b << 16) &- b) &+ UInt32(byte) // b = b*65599 - b + byte
+        }
+        // Spread into 16 bytes deterministically
+        for i in 0..<16 {
+            let v = (i % 2 == 0) ? (a &+ UInt32(i * 17)) : (b &+ UInt32(i * 31))
+            hash[i] = UInt8(truncatingIfNeeded: v >> 8) &+ UInt8(truncatingIfNeeded: v)
+        }
+        return (hash[0],hash[1],hash[2],hash[3],hash[4],hash[5],hash[6],hash[7],hash[8],hash[9],hash[10],hash[11],hash[12],hash[13],hash[14],hash[15])
+    }
+
+    @objc private func syncFromCalendarAction() {
+        statusItem.menu?.cancelTracking()
+        requestCalendarAccessIfNeeded { [weak self] granted in
+            guard let self = self else { return }
+            if !granted {
+                let alert = NSAlert()
+                alert.messageText = "Calendar access required"
+                alert.informativeText = "Please grant Calendar permission in System Settings → Privacy & Security → Calendars."
+                alert.runModal()
+                return
+            }
+
+            let now = Date()
+            let imported = self.fetchUpcomingCalendarMeetings(hoursAhead: 24)
+
+            // Merge: replace non-repeating one-time meetings that came from calendar within range
+            // For simplicity, we clear non-repeating future meetings and replace with imported ones.
+            self.meetings.removeAll { m in
+                guard !m.repeatsWeekly else { return false }
+                guard let next = m.nextOccurrence(after: now) else { return true }
+                return next > now
+            }
+            self.meetings.append(contentsOf: imported)
+            self.lastCalendarSync = Date()
+            self.saveMeetings()
+            self.buildMenu()
+            self.tick()
+        }
+    }
+
+    @objc private func toggleCalendarAutoSync(_ sender: NSMenuItem) {
+        calendarSyncEnabled.toggle()
+        UserDefaults.standard.set(calendarSyncEnabled, forKey: "NewsTimer.calendarSyncEnabled")
+        sender.state = calendarSyncEnabled ? .on : .off
+        if calendarSyncEnabled {
+            syncFromCalendarAction()
+        }
+    }
+
+    @objc private func toggleCalendarAutoRefresh(_ sender: NSMenuItem) {
+        calendarAutoRefreshEnabled.toggle()
+        UserDefaults.standard.set(calendarAutoRefreshEnabled, forKey: "NewsTimer.calendarAutoRefreshEnabled")
+        sender.state = calendarAutoRefreshEnabled ? .on : .off
+        if calendarAutoRefreshEnabled {
+            scheduleCalendarAutoRefresh()
+        } else {
+            calendarRefreshTimer?.invalidate()
+            calendarRefreshTimer = nil
         }
     }
 }
